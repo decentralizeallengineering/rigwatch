@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop VMs past their lease every 2min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,37 @@
+#!/bin/bash
+# ram-guard (called every 30 s from heavy-guard.sh, or run it from its own timer):
+#  available RAM < RAM_REFUSE_GB (default 10) -> alarm (vm-lease refuses new leases for stopped VMs);
+#  available RAM < RAM_STOP_GB (default 6)   -> clean shutdown of the lowest-priority running VM, one at a time:
+#  rank 1 idle GPU model-server VM, 2 other VMs, 3 busy model-server VM, 4 VMs named in RAM_PROTECT_VMS (stopped last).
+# Test: MC_RAM_AVAIL_GB=5 MC_DRYRUN=1 ram-guard   (MC_VMS="a b c" overrides the running list)
+case ${1-} in -h|--help) echo "usage: ram-guard   (--help exits 2 without side effects)"; echo "Alarm when available RAM is low; below RAM_STOP_GB cleanly shut down the lowest-priority running VM."; exit 2 ;; esac
+. "$(dirname "$(readlink -f "$0")")/vm-lib.sh"
+: "${RAM_PROTECT_VMS:=}"
+mkdir -p "$LEASE_DIR" "$RIGWATCH_STATE_DIR"; now=$(date +%s)
+ram_ge "$RAM_REFUSE_GB" && exit 0
+a=$(ram_avail_gb); st=$RIGWATCH_STATE_DIR/ram-guard.alarm
+if [ ! -e "$st" ] || [ $((now - $(cat "$st"))) -ge 600 ]; then echo "$now" > "$st"; mc_alarm ram-guard "available RAM ${a} GB (<$RAM_REFUSE_GB): new VM starts refused"; fi
+ram_ge "$RAM_STOP_GB" && exit 0
+vms=${MC_VMS:-$(virsh list --name | grep -v '^$')}
+gpu_vms=$(gpu_vm_domains)
+rank() {
+  if grep -qwx "$1" <<<"$(tr ' ' '\n' <<<"$RAM_PROTECT_VMS")"; then echo 4
+  elif grep -qx "$1" <<<"$gpu_vms"; then
+    if [ -e "$LEASE_DIR/$1" ] && [ "$(cut -d' ' -f2 "$LEASE_DIR/$1")" = serving ] && [ "$(cut -d' ' -f1 "$LEASE_DIR/$1")" -gt $((now+600)) ]; then echo 3; else echo 1; fi
+  else echo 2; fi
+}
+order=$(for v in $vms; do echo "$(rank "$v") $v"; done | sort -n)
+[ -n "$order" ] || exit 0
+[ "${MC_DRYRUN:-}" = 1 ] && echo "shutdown order: $(echo $order | tr '\n' ' ')"
+# one shutdown at a time: skip while a previous one (< 180 s) is pending; force-stop it after 180 s
+pend=$RIGWATCH_STATE_DIR/ram-guard.pending
+if [ -e "$pend" ] && [ "${MC_DRYRUN:-}" != 1 ]; then read -r pt pv < "$pend"
+  if [ "$(virsh domstate "$pv" 2>/dev/null)" = running ]; then
+    if [ $((now - pt)) -lt 180 ]; then exit 0; fi
+    virsh destroy "$pv" >/dev/null 2>&1; mc_alarm ram-guard "$pv ignored shutdown, force-stopped (RAM ${a} GB)"
+  fi; rm -f "$pend"; ram_ge "$RAM_STOP_GB" && exit 0; fi
+victim=$(echo "$order" | head -1 | cut -d' ' -f2)
+mc_alarm ram-guard "available RAM ${a} GB (<$RAM_STOP_GB): shutting down $victim (rank $(echo "$order" | head -1 | cut -d' ' -f1))"
+[ "${MC_DRYRUN:-}" = 1 ] && { echo "WOULD virsh shutdown $victim"; exit 0; }
+virsh shutdown "$victim" >/dev/null 2>&1; echo "$now $victim" > "$pend"
+exit 0

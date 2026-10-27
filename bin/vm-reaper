@@ -1,0 +1,41 @@
+#!/bin/bash
+# vm-reaper (timer, 2 min): every running VM needs a lease (see vm-lease). A VM without a lease gets DEFAULT_LEASE_MIN
+# (default 30). An expired lease means a clean shutdown, then a force-stop after VM_FORCE_S (default 180 s). Each action logs an alarm.
+# GPU model-server VMs (the libvirt domains named in the 4th field of gpus.conf) renew SERVING_LEASE_MIN (default 15)
+# minutes, but only while serving: established connections on SERVING_PORTS (default "8001 8002 8080") or GPU utilization above 5 %.
+case ${1-} in -h|--help) echo "usage: vm-reaper   (--help exits 2 without side effects)"; echo "Stops running VMs whose lease (vm-lease) has expired; clean shutdown first, force-stop after VM_FORCE_S seconds."; exit 2 ;; esac
+. "$(dirname "$(readlink -f "$0")")/vm-lib.sh"
+: "${DEFAULT_LEASE_MIN:=30}"; : "${SERVING_LEASE_MIN:=15}"; : "${SERVING_PORTS:=8001 8002 8080}"
+mkdir -p "$LEASE_DIR"; now=$(date +%s); FORCE=${VM_FORCE_S:-180}
+serving() {  # exit 0 if model-server VM $1 is serving
+  local h; h=$(gpu_vm_host "$1"); [ -n "$h" ] || return 1
+  local cond="" p; for p in $SERVING_PORTS; do cond="$cond${cond:+ or }sport = :$p"; done
+  local out; out=$(rw_ssh "$h" "ss -Htn state established '( $cond )' | wc -l; nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | sort -n | tail -1" 2>/dev/null) || return 1
+  local c u; c=$(sed -n 1p <<<"$out"); u=$(sed -n 2p <<<"$out")
+  [ "${c:-0}" -gt 0 ] || [ "${u:-0}" -gt 5 ]
+}
+running=$(virsh list --name | grep -v '^$')
+gpu_vms=$(gpu_vm_domains)
+for vm in $running; do
+  f=$LEASE_DIR/$vm; sf=$LEASE_DIR/$vm.stopping
+  if grep -qx "$vm" <<<"$gpu_vms" && serving "$vm"; then
+    read -r cur _ < "$f" 2>/dev/null
+    # never shorten an explicit longer lease
+    [ "${cur:-0}" -lt $((now + SERVING_LEASE_MIN * 60)) ] && vm_lease_set "$vm" "$SERVING_LEASE_MIN" serving
+  fi
+  if [ ! -e "$f" ]; then
+    if grep -qx "$vm" <<<"$gpu_vms"; then m=$SERVING_LEASE_MIN; else m=$DEFAULT_LEASE_MIN; fi
+    vm_lease_set "$vm" "$m" default; mc_alarm vm-reaper "$vm running with no lease: ${m} min default lease set"; continue
+  fi
+  read -r exp _ < "$f"
+  if [ "$now" -lt "$exp" ]; then rm -f "$sf"; continue; fi
+  if [ ! -e "$sf" ]; then
+    virsh shutdown "$vm" >/dev/null 2>&1; echo "$now" > "$sf"; mc_alarm vm-reaper "$vm lease expired, clean shutdown sent"
+  elif [ $((now - $(cat "$sf"))) -ge "$FORCE" ]; then
+    virsh destroy "$vm" >/dev/null 2>&1; rm -f "$sf" "$f"; mc_alarm vm-reaper "$vm still up ${FORCE}s after shutdown, force-stopped"
+  fi
+done
+# stopped VMs: drop their leases (a start needs a new one)
+for f in "$LEASE_DIR"/*; do [ -e "$f" ] || continue; b=$(basename "$f"); b=${b%.stopping}
+  grep -qx "$b" <<<"$running" || rm -f "$LEASE_DIR/$b" "$LEASE_DIR/$b.stopping"; done
+exit 0

@@ -1,0 +1,4 @@
+[Unit]
+Description=Heavy jobs (frozen by the thermal guards when the machine runs hot)
+
+[Slice]

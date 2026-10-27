@@ -1,0 +1,6 @@
+[Unit]
+Description=CPU, GPU, disk thermal guard and RAM guard
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/heavy-guard.sh

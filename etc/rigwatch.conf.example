@@ -1,0 +1,78 @@
+# rigwatch.conf: copy to ~/.config/rigwatch/rigwatch.conf (or point RIGWATCH_CONF at it).
+# Plain KEY=VALUE lines, never executed as shell. An environment variable of the same name wins over this file.
+# Everything is optional; the values shown are the defaults.
+
+# --- where things go
+#RIGWATCH_STATE_DIR=$HOME/.local/state/rigwatch   # use a literal path here, $HOME is not expanded in this file
+#ALERT_FILE=                  # default <state dir>/alerts.log; one line per ALERT
+#ALARM_FILE=                  # default <state dir>/alarms.log; one line per automatic action
+#ALARM_HOOK=                  # command called as: $ALARM_HOOK "<line>" for every alarm (mail, chat webhook script, ...)
+#GPU_CONF=                    # default ~/.config/rigwatch/gpus.conf, see gpus.conf.example
+#NODE_NAME=                   # default: short hostname
+
+# --- temperature limits in degrees C (everything else is derived from these three)
+#GPU_MAX_C=70
+#CPU_MAX_C=70
+#SAS_MAX_C=60
+#NVME_MAX_C=70                # default: CPU_MAX_C
+# derived defaults, override only if you must:
+#GPU_GUARD_HOT=68             # GPU_MAX_C - 2: power limit steps down
+#GPU_GUARD_COOL=60            # GPU_MAX_C - 10: power limit steps back up
+#CPU_FREEZE_C=68              # CPU_MAX_C - 2: heavy-guard freezes the slice
+#CPU_THAW_C=62                # CPU_MAX_C - 8
+#MESH_WARN_C=65               # CPU_MAX_C - 5: thermal-mesh first action
+#MESH_FREEZE_C=68             # CPU_MAX_C - 2
+#SAS_WARN_C=55                # SAS_MAX_C - 5
+#SAS_FREEZE_C=60              # SAS_MAX_C
+#SAS_RESUME_C=50              # SAS_MAX_C - 10
+#GPU_ALERT_HOT=72             # hwwatch alert levels
+#GPU_ALERT_CRIT=78
+#CPU_ALERT_HOT=75
+
+# --- fire-risk cutoffs (emergency.sh powers off)
+#HARD_MAX=100                 # any device at or above: power off at once
+#CPU_CUTOFF=100               # two consecutive 30 s readings at or above: power off
+#GPU_CUTOFF=92
+#RAM_CUTOFF=85
+#EXPECTED_HOST_GPUS=0         # GPUs expected on the host NVIDIA driver (0 = none, VM cards only)
+#POWEROFF_CMD=sudo -n systemctl poweroff
+
+# --- freezing heavy work
+#FREEZE_SLICE=heavy.slice     # heavy-guard
+#FREEZE_SLICES=heavy.slice    # thermal-mesh (space separated)
+#SAS_DRIVES=                  # e.g. "sda sdb sdc"; empty disables SAS checks
+#SAS_POOL=                    # zpool name; if set, SAS drives are only probed while it is imported
+#MESH_DEST=                   # user@host:/dir, push this node's status row to a collector over ssh
+#STATSD_ADDR=                 # host:port, send gauges to statsd
+
+# --- GPUs in VMs
+#GPU_SSH_USER=                # default: current user
+#GPU_SSH_KEY=                 # identity file for ssh to VM GPUs
+#GPU_HANDOFF_LOCK=            # lock file held while a card moves between host and VM
+
+# --- hwwatch
+#EXPECT_HOST_GPUS=0
+#FAN_SERVICE=                 # systemd unit that must be active (fan curve daemon)
+#DISK_PATHS=/                 # mount points to check
+#DISK_ALERT_PCT=85
+#DISK_FILL_GB_10MIN=15
+
+# --- VM leases and RAM
+#LEASE_DIR=                   # default <state dir>/vm-leases
+#DEFAULT_LEASE_MIN=30
+#SERVING_LEASE_MIN=15
+#SERVING_PORTS=8001 8002 8080
+#RAM_REFUSE_GB=10
+#RAM_STOP_GB=6
+#RAM_PROTECT_VMS=             # VMs ram-guard stops last, space separated
+
+# --- r1-enforcer
+#R1_PATTERN=pytest|mutmut|stress-ng|stress
+#R1_EXEMPT_ARGV=systemd-run
+#R1_EXEMPT_CGROUPS=heavy.slice
+
+# --- llm-gpu-check
+#LLM_CONTAINER=llm
+#DOCKER_CMD=docker            # e.g. sudo -n docker
+#CUDA_FAIL_PATTERN=failed to initialize CUDA
+#CUDA_WAIT_TRIES=30

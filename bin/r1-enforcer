@@ -1,0 +1,55 @@
+#!/bin/bash
+# r1-enforcer: rule 1, heavy commands (pytest, mutmut, stress, stress-ng by default) must run inside a sanctioned wrapper,
+# so the thermal guards can freeze them. A process is exempt when its argv, or any ancestor's argv, contains one of
+# R1_EXEMPT_ARGV (default "systemd-run"), or its cgroup (or an ancestor's) contains one of R1_EXEMPT_CGROUPS (default "heavy.slice").
+# Mode file $RIGWATCH_CONF dir/r1-mode (default ~/.config/rigwatch/r1-mode): "log" (default, writes R1_LOG) or "kill"
+# (writes ALARM_FILE and sends SIGTERM). Other settings: R1_PATTERN (extended regex of command names), R1_USER (default: current user).
+# Source it with R1_SOURCE_ONLY=1 to test is_exempt.
+case ${1-} in -h|--help) echo "usage: r1-enforcer   (--help exits 2 without side effects)"; echo "Flags heavy test/stress commands running outside a sanctioned wrapper; mode log or kill."; exit 2 ;; esac
+. "$(dirname "$(readlink -f "$0")")/rigwatch-conf.sh"
+: "${R1_MODE_FILE:=$(dirname "$RIGWATCH_CONF")/r1-mode}"
+: "${R1_PATTERN:=pytest|mutmut|stress-ng|stress}"
+: "${R1_EXEMPT_ARGV:=systemd-run}"
+: "${R1_EXEMPT_CGROUPS:=heavy.slice}"
+: "${R1_USER:=$(id -un)}"
+: "${R1_LOG:=$RIGWATCH_STATE_DIR/r1-enforcer.log}"   # log-mode hits are routine, so they go here and not to the alarm file
+MODE=$(cat "$R1_MODE_FILE" 2>/dev/null || echo log)
+SEEN=$RIGWATCH_STATE_DIR/r1-seen; mkdir -p "$RIGWATCH_STATE_DIR"; touch "$SEEN"
+HOST=$NODE_NAME
+PROC=${R1_PROC:-/proc}
+matches_any() {  # matches_any <text> <space separated words>: true if text contains any word
+  local w; for w in $2; do case "$1" in *"$w"*) return 0;; esac; done; return 1
+}
+# exempt: argv has an exempt wrapper, the cgroup is an exempt one, or any ancestor is (the client may be the parent of the job)
+is_exempt() {
+  local pid=$1 args=$2 cg depth=0
+  while [ "$pid" -gt 1 ] 2>/dev/null && [ $depth -lt 12 ]; do
+    matches_any "$args" "$R1_EXEMPT_ARGV" && return 0
+    cg=$(cat "$PROC/$pid/cgroup" 2>/dev/null) || return 1
+    matches_any "$cg" "$R1_EXEMPT_CGROUPS" && return 0
+    pid=$(sed 's/.*) //' "$PROC/$pid/stat" 2>/dev/null | awk '{print $2}') || return 1
+    args=$({ tr '\0' ' ' < "$PROC/$pid/cmdline"; } 2>/dev/null) || true
+    depth=$((depth+1))
+  done
+  return 1
+}
+[ -n "$R1_SOURCE_ONLY" ] && return 0 2>/dev/null
+ps -eo pid=,user=,args= | grep -E "$R1_PATTERN" | grep -v -E 'grep|r1-enforcer' | while read -r pid user args; do
+  [ "$user" = "$R1_USER" ] || continue
+  # skip terminals, remote shells and agents that merely mention the words
+  case "$args" in
+    *"tmux"*|*"ssh "*) continue;;
+  esac
+  # only real command heads: python -m pytest / pytest / mutmut / stress
+  echo "$args" | grep -qE "(^|/| )($R1_PATTERN)( |\$)|-m pytest" || continue
+  [ -r "$PROC/$pid/cgroup" ] || continue
+  is_exempt "$pid" "$args" && continue
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+  key="$pid:$(stat -c %Y "/proc/$pid" 2>/dev/null)"
+  if ! grep -qx "$key" "$SEEN"; then
+    echo "$key" >> "$SEEN"
+    echo "$(date '+%F %T') R1 $HOST $MODE: outside wrapper pid=$pid cwd=$cwd cmd=$(echo "$args" | cut -c1-120)" >> "$([ "$MODE" = log ] && echo "$R1_LOG" || echo "$ALARM_FILE")"
+  fi
+  [ "$MODE" = kill ] && kill -TERM "$pid" 2>/dev/null
+done
+tail -n 500 "$SEEN" > "$SEEN.tmp" && mv "$SEEN.tmp" "$SEEN"

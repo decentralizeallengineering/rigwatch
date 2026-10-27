@@ -1,0 +1,6 @@
+[Unit]
+Description=Hardware watchdog
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hwwatch.sh

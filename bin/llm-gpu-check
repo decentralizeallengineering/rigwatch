@@ -1,0 +1,27 @@
+#!/bin/sh
+# llm-gpu-check: run once after boot. A GPU container (for example a llama.cpp server) that starts before the NVIDIA driver
+# is ready silently falls back to the CPU ("failed to initialize CUDA: no CUDA-capable device is detected") and can run for
+# days that way. This waits for nvidia-smi to work, then restarts the container once if its log since its last start
+# contains the failure marker.
+#
+# Configuration (environment, or rigwatch.conf in ${XDG_CONFIG_HOME:-$HOME/.config}/rigwatch/):
+#   LLM_CONTAINER      container name                        (default: llm)
+#   DOCKER_CMD         docker command, e.g. "sudo -n docker" (default: docker)
+#   CUDA_FAIL_PATTERN  log text that means it fell back      (default: failed to initialize CUDA)
+#   CUDA_WAIT_TRIES    seconds/10 to wait for the driver     (default: 30)
+case "$1" in -h|--help) echo "usage: llm-gpu-check   (restarts \$LLM_CONTAINER once if it started without CUDA; --help exits 2 without side effects)"; exit 2;; esac
+conf=${RIGWATCH_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/rigwatch/rigwatch.conf}
+getconf() { # getconf KEY DEFAULT: environment, then config file, then default
+  eval "v=\${$1-}"; [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+  v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$conf" 2>/dev/null | sed 's/[[:space:]]*#.*//; s/^"\(.*\)"$/\1/' | tail -1)
+  printf '%s\n' "${v:-$2}"
+}
+LLM_CONTAINER=$(getconf LLM_CONTAINER llm); DOCKER_CMD=$(getconf DOCKER_CMD docker)
+CUDA_FAIL_PATTERN=$(getconf CUDA_FAIL_PATTERN "failed to initialize CUDA"); CUDA_WAIT_TRIES=$(getconf CUDA_WAIT_TRIES 30)
+i=0
+while [ "$i" -lt "$CUDA_WAIT_TRIES" ]; do nvidia-smi >/dev/null 2>&1 && break; i=$((i+1)); sleep 10; done
+s=$($DOCKER_CMD inspect -f "{{.State.StartedAt}}" "$LLM_CONTAINER") || exit 1
+if $DOCKER_CMD logs --since "$s" "$LLM_CONTAINER" 2>&1 | grep -q "$CUDA_FAIL_PATTERN"; then
+  logger -t llm-gpu-check "$LLM_CONTAINER started without CUDA; restarting" 2>/dev/null || true
+  $DOCKER_CMD restart "$LLM_CONTAINER"
+fi

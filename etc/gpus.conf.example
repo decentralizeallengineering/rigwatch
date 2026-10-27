@@ -1,0 +1,9 @@
+# gpus.conf: the GPU inventory read by gputemp-guard, heavy-guard, thermal-mesh, emergency, hwwatch, vm-reaper and ram-guard.
+# One card per line:  label | where | capW [| libvirt domain]
+#   where   local:INDEX         card on this host's NVIDIA driver (nvidia-smi index)
+#           ssh:[user@]host     card passed through to a VM; read and set over ssh (user defaults to GPU_SSH_USER)
+#   capW    baseline power limit in watts, restored when the card has stayed cool; '-' = monitor only, never change the limit
+#   domain  libvirt domain of the VM: a shut-off VM is skipped quietly, and vm-reaper treats it as a model server
+host-gpu0|local:0|220
+vm-gpu1|ssh:192.0.2.10|170|gpu-vm-1
+vm-gpu2|ssh:ann@192.0.2.11|-|gpu-vm-2

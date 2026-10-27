@@ -1,0 +1,6 @@
+[Unit]
+Description=GPU thermal guard
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gputemp-guard

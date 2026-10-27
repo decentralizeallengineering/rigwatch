@@ -1,0 +1,6 @@
+[Unit]
+Description=Fire-risk temperature cutoff
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/emergency.sh

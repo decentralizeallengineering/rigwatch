@@ -1,0 +1,10 @@
+[Unit]
+Description=GPU thermal guard every 30s
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+#!/bin/bash
+# vm-lease <vm> <minutes> [reason]: set or renew the VM's expiry. vm-reaper stops the VM when it passes.
+# Refuses to lease a stopped VM when available RAM is below RAM_REFUSE_GB (default 10 GB).
+case ${1-} in -h|--help) echo "usage: vm-lease <vm> <minutes> [reason]   (--help exits 2 without side effects)"; echo "Set or renew the VM's expiry. vm-reaper stops the VM when it passes. Refuses to lease a stopped VM when available RAM is below RAM_REFUSE_GB."; exit 2 ;; esac
+set -u
+. "$(dirname "$(readlink -f "$0")")/vm-lib.sh"
+vm=${1:?usage: vm-lease <vm> <minutes> [reason]}; min=${2:?minutes}; reason=${3:-manual}
+case $min in ''|*[!0-9]*) echo "ERR: minutes must be a number" >&2; exit 2;; esac
+[ -n "$(vm_state "$vm")" ] || { echo "ERR: no such VM $vm" >&2; exit 2; }
+if [ "$(vm_state "$vm")" != running ] && ! ram_ge "$RAM_REFUSE_GB"; then
+  echo "ERR: RAM: only $(ram_avail_gb) GB available (<$RAM_REFUSE_GB), refusing lease for stopped VM $vm" >&2
+  mc_alarm vm-lease "RAM refused lease/start of $vm ($(ram_avail_gb) GB available)"; exit 3
+fi
+vm_lease_set "$vm" "$min" "$reason"
+echo "lease $vm ${min} min ($reason), expires $(date -d @"$(cut -d' ' -f1 "$LEASE_DIR/$vm")" '+%H:%M:%S')"

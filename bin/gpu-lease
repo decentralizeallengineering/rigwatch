@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""gpu-lease: advisory GPU leases for the host's NVIDIA cards. Does not touch power caps or clocks.
+
+  gpu-lease list
+  gpu-lease take ROLE [--gpu any|INDEX|NAME|UUID] [--hours H] [--mem-gb G] [--wait]   prints: export CUDA_VISIBLE_DEVICES=<uuid>
+  gpu-lease run  ROLE [options] -- COMMAND...      take a lease, run COMMAND on that card, release afterwards; SIGTERM the
+                                                   job if the card stays at or above GPU_LEASE_KILL_C for GPU_LEASE_HOT_SECS
+  gpu-lease release ROLE [--gpu ...]
+  gpu-lease play PLAYER [--gpu ...] / unplay PLAYER    interactive use of a card (for example a game session): lease jobs on it
+                                                       are paused (SIGSTOP) or, with little free GPU memory, terminated
+
+A card hotter than GPU_LEASE_MAX_TAKE_C (default 75) is not leased. A lease expires after --hours (at most 12).
+Configuration comes from the environment or rigwatch.conf: RIGWATCH_STATE_DIR, ALERT_FILE, GPU_LEASE_FILE (default
+$RIGWATCH_STATE_DIR/gpu-leases.json), GPU_LEASE_MAX_TAKE_C, GPU_LEASE_KILL_C, GPU_LEASE_PLAYERS (comma list of allowed
+player names, empty = any name), GPU_LEASE_PLAY_UNIT (systemd unit glob that must be active for a play lease to stay, empty = no check),
+GPU_LEASE_PLAY_GPUS (comma list of GPU name substrings a play lease takes when --gpu is omitted, empty = all cards),
+GPU_LEASE_DEBUG_ROLES (comma list of roles that must pass --debug, empty = none).
+Test env: GPU_LEASE_NOW (epoch), GPU_LEASE_FAKE_TEMP, GPU_LEASE_POLL, GPU_LEASE_HOT_SECS, GPU_LEASE_FAKE_FREE_GB (free memory),
+GPU_LEASE_FAKE_PLAY (1/0 instead of the play-unit check), GPU_LEASE_WAIT_POLL (30), GPU_LEASE_PLAY_GRACE (120)"""
+import argparse, fcntl, json, os, re, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+_CONF = os.environ.get("RIGWATCH_CONF", os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "rigwatch/rigwatch.conf"))
+def _file_conf():
+    res = {}
+    try:
+        for ln in open(_CONF):
+            a, sep, b = ln.split("#")[0].partition("=")
+            a = a.strip()
+            if sep and re.fullmatch(r"[A-Z][A-Z0-9_]*", a): res[a] = b.strip().strip("\"'")
+    except OSError: pass
+    return res
+_FC = _file_conf()
+def cfg(key, default=""):
+    return os.environ.get(key, _FC.get(key, default))
+def cfg_list(key):
+    return [x.strip() for x in cfg(key).split(",") if x.strip()]
+
+STATE_DIR = cfg("RIGWATCH_STATE_DIR", HOME + "/.local/state/rigwatch")
+LEASES = cfg("GPU_LEASE_FILE", STATE_DIR + "/gpu-leases.json")
+ALERTS = cfg("ALERT_FILE", STATE_DIR + "/alerts.log")
+MAX_TAKE_TEMP, KILL_TEMP = float(cfg("GPU_LEASE_MAX_TAKE_C", "75")), float(cfg("GPU_LEASE_KILL_C", "83"))
+PLAYERS_CFG, PLAY_UNIT, PLAY_GPUS, DEBUG_ROLES = cfg_list("GPU_LEASE_PLAYERS"), cfg("GPU_LEASE_PLAY_UNIT"), cfg_list("GPU_LEASE_PLAY_GPUS"), cfg_list("GPU_LEASE_DEBUG_ROLES")
+POLL = float(os.environ.get("GPU_LEASE_POLL", "10"))
+HOT_SECS = float(os.environ.get("GPU_LEASE_HOT_SECS", "30"))
+WAIT_POLL = float(os.environ.get("GPU_LEASE_WAIT_POLL", "30"))
+GRACE = float(os.environ.get("GPU_LEASE_PLAY_GRACE", "120"))
+LOCK_TIMEOUT = float(os.environ.get("GPU_LEASE_LOCK_TIMEOUT", "10"))
+PLAY_MAX, PLAY_MIN_FREE_GB = 6 * 3600, 6.0
+
+def now():
+    return float(os.environ.get("GPU_LEASE_NOW") or time.time())
+
+def gpus():
+    q = "index,uuid,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw"
+    try:
+        out = subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20, check=True).stdout
+    except Exception as e:
+        sys.exit(f"gpu-lease: nvidia-smi failed: {e}")
+    res = []
+    for ln in out.strip().splitlines():
+        p = [x.strip() for x in ln.split(",")]
+        f = lambda s: float(s) if s.replace(".", "", 1).isdigit() else 0.0
+        res.append(dict(index=int(p[0]), uuid=p[1], name=p[2], temp=f(p[3]), util=f(p[4]),
+                        used=f(p[5]), total=f(p[6]), power=f(p[7])))
+    ft = os.environ.get("GPU_LEASE_FAKE_TEMP")
+    if ft:
+        for g in res: g["temp"] = float(ft)
+    return res
+
+def play_active():
+    f = os.environ.get("GPU_LEASE_FAKE_PLAY")
+    if f is not None: return f == "1"
+    if not PLAY_UNIT: return True  # no unit configured: a play lease lasts until unplay or the 6 h cap
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", PLAY_UNIT], timeout=10).returncode == 0
+    except Exception:
+        return True  # cannot tell: keep the lease, the 6 h cap still applies
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+    except Exception:
+        return False
+
+def tree(pid):
+    kids = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try: kids.setdefault(int(open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()[1]), []).append(int(d))
+            except Exception: pass
+    out, todo = [], [pid]
+    while todo:
+        x = todo.pop(); out.append(x); todo += kids.get(x, [])
+    return out
+
+def protected():
+    """pids play/unplay must never signal: self, all ancestors, and anything in our own process group."""
+    out, x = {os.getpid()}, os.getppid()
+    while x > 1 and x not in out:
+        out.add(x)
+        try: x = int(open(f"/proc/{x}/stat").read().rsplit(")", 1)[1].split()[1])
+        except Exception: break
+    return out
+
+def pgid_of(pid):
+    try: return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[3])
+    except Exception: return None
+
+def is_protected(pid, prot=None):
+    prot = protected() if prot is None else prot
+    return pid in prot or pgid_of(pid) == os.getpgrp()
+
+def signal_tree(pid, sig):
+    """Signal pid and its descendants, skipping self/ancestors/own process group. Returns False (and signals nothing)
+    if pid itself is protected, i.e. the caller lives inside that job."""
+    prot = protected()
+    if is_protected(pid, prot): return False
+    for x in tree(pid):
+        if is_protected(x, prot): continue
+        try: os.kill(x, sig)
+        except OSError: pass
+    return True
+
+def play_on(data, uuid):
+    return [l for l in data.values() if l.get("kind") == "play" and l["gpu"] == uuid]
+
+class Locked:
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LEASES), exist_ok=True)
+        self.fd = os.open(LEASES + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+        end = time.time() + LOCK_TIMEOUT
+        while True:
+            try: fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except OSError:
+                if time.time() >= end:
+                    os.close(self.fd)
+                    sys.exit(f"gpu-lease: could not get lock {LEASES}.lock within {LOCK_TIMEOUT:g}s (held by another process)")
+                time.sleep(0.05)
+        try:
+            self.data = json.load(open(LEASES))
+        except Exception:
+            self.data = {}
+        t = now()
+        self.data = {u: l for u, l in self.data.items() if l.get("expires", 0) > t}
+        self.dirty = False
+        plays = [u for u, l in self.data.items() if l.get("kind") == "play"]
+        if plays and not play_active():
+            for u in plays:
+                if t - self.data[u].get("start", 0) >= GRACE: del self.data[u]; self.dirty = True
+        self.reconcile()
+        return self
+    def reconcile(self):
+        """Resume paused jobs on GPUs that no longer have a play lease."""
+        busy = {l["gpu"] for l in self.data.values() if l.get("kind") == "play"}
+        for u, l in self.data.items():
+            if l.get("kind") != "play" and l.get("paused") and u not in busy:
+                for p in l["paused"]: signal_tree(p, signal.SIGCONT)
+                l["paused"] = []; self.dirty = True
+    def save(self):
+        tmp = LEASES + ".tmp"
+        json.dump(self.data, open(tmp, "w"), indent=1)
+        os.replace(tmp, LEASES)
+    def __exit__(self, et, *a):
+        if self.dirty and et is None: self.save()
+        os.close(self.fd)
+
+def resolve(gs, spec):
+    if spec in (None, "any"): return None
+    s = spec.lower()
+    m = [g for g in gs if g["uuid"].lower() == s or g["uuid"].lower().startswith(s)
+         or str(g["index"]) == s or s in g["name"].lower()]
+    if not m: sys.exit(f"gpu-lease: no GPU matches '{spec}'")
+    return m
+# name match may be ambiguous (two cards of one model): treat as candidates
+
+DEBUG_MSG = "refused: this role may lease a GPU only for debugging; add --debug. Interactive sessions use `gpu-lease play`."
+def need_debug(a):
+    if a.role in DEBUG_ROLES and not getattr(a, "debug", False): sys.exit("gpu-lease: " + DEBUG_MSG)
+
+def take_lease(role, spec, hours, mem_gb, wait=False):
+    hours = max(0.01, min(float(hours), 12.0))
+    while True:
+        gs = gpus()
+        cands = resolve(gs, spec) or gs
+        with Locked() as L:
+            reasons, ok, blocked = [], [], False
+            for g in cands:
+                tag = f"{g['name']}#{g['index']}"
+                pl = play_on(L.data, g["uuid"])
+                if pl: reasons.append(f"{tag}: play lease ({', '.join(x['player'] for x in pl)})"); blocked = True; continue
+                h = L.data.get(g["uuid"])
+                if h and h["role"] != role: reasons.append(f"{tag}: held by {h['role']}"); continue
+                if g["temp"] > MAX_TAKE_TEMP: reasons.append(f"{tag}: {g['temp']:.0f}C > {MAX_TAKE_TEMP}C"); continue
+                free = (g["total"] - g["used"]) / 1024
+                if mem_gb and free < mem_gb: reasons.append(f"{tag}: {free:.1f} GB free < {mem_gb}"); continue
+                ok.append(g)
+            if ok:
+                g = min(ok, key=lambda g: (g["uuid"] in L.data, g["temp"]))  # free cards before ones this role already holds
+                old = L.data.get(g["uuid"]) or {}
+                new = dict(role=role, start=now(), expires=now() + hours * 3600, pid=os.getpid())
+                for k in ("children", "paused"):
+                    if old.get(k): new[k] = old[k]
+                L.data[g["uuid"]] = new
+                L.save()
+                return g
+            if not (blocked and wait): 
+                alt = [x for x in gs if not play_on(L.data, x["uuid"]) and x["temp"] <= MAX_TAKE_TEMP
+                       and (x["uuid"] not in L.data or L.data[x["uuid"]]["role"] == role)
+                       and not (mem_gb and (x["total"] - x["used"]) / 1024 < mem_gb)]
+                hint = ""
+                if blocked:
+                    c = min(alt, key=lambda x: x["temp"]) if alt else None
+                    hint = (f"; try --gpu {c['index']} ({c['name']}, {c['temp']:.0f}C), or --wait" if c
+                            else "; no other GPU is free, use --wait")
+                sys.exit("gpu-lease: refused: " + "; ".join(reasons) + hint)
+        time.sleep(WAIT_POLL)
+
+def release_lease(role, uuid=None):
+    n = 0
+    with Locked() as L:
+        for u in list(L.data):
+            if L.data[u]["role"] == role and (uuid is None or u == uuid):
+                del L.data[u]; n += 1
+        L.save()
+    return n
+
+def cmd_list(a):
+    gs = gpus()
+    with Locked() as L:
+        for g in gs:
+            h = L.data.get(g["uuid"])
+            hm = lambda x: time.strftime('%H:%M', time.localtime(x['expires']))
+            hold = f"{h['role']} (until {hm(h)})" if h else "free"
+            if h and h.get("paused"): hold += " paused-by-play"
+            pl = play_on(L.data, g["uuid"])
+            if pl: hold = "PLAY " + ",".join(f"{x['player']} (until {hm(x)})" for x in pl) + (f" | {hold}" if h else "")
+            print(f"{g['index']} {g['name']} {g['uuid']} {g['temp']:.0f}C {g['util']:.0f}% "
+                  f"{g['used']:.0f}/{g['total']:.0f}MiB {g['power']:.0f}W lease={hold}")
+
+def cmd_take(a):
+    need_debug(a)
+    g = take_lease(a.role, a.gpu, a.hours, a.mem_gb, a.wait)
+    print(f"# {a.role} holds {g['name']} #{g['index']} ({g['temp']:.0f}C)", file=sys.stderr)
+    print(f"export CUDA_VISIBLE_DEVICES={g['uuid']}")
+
+def cmd_release(a):
+    gs = gpus(); c = resolve(gs, a.gpu)
+    n = 0
+    if c is None: n = release_lease(a.role)
+    else:
+        for g in c: n += release_lease(a.role, g["uuid"])
+    print(f"released {n}")
+
+def preempt(L, g):
+    """Called under lock when play holds GPU g: pause (enough free mem) or SIGTERM run jobs."""
+    l = L.data.get(g["uuid"])
+    if not l: return
+    free = float(os.environ.get("GPU_LEASE_FAKE_FREE_GB") or (g["total"] - g["used"]) / 1024)
+    done = l.setdefault("paused", [])
+    todo = [p for p in l.get("children", []) if alive(p) and p not in done]
+    for p in todo:
+        if is_protected(p): continue  # caller is inside (or is) this job: never freeze/kill ourselves
+        if free >= PLAY_MIN_FREE_GB:
+            signal_tree(p, signal.SIGSTOP); done.append(p)
+        else:
+            alert(f"play preempt: SIGTERM {l['role']} job pid {p} on {g['name']} {g['uuid']} "
+                  f"({free:.1f} GB free < {PLAY_MIN_FREE_GB:.0f}); requeue role {l['role']}")
+            try: os.kill(p, signal.SIGTERM)
+            except OSError: pass
+            l["children"].remove(p)
+
+def cmd_play(a):
+    gs = gpus()
+    c = resolve(gs, a.gpu)
+    tg = c if c else [g for g in gs if not PLAY_GPUS or any(x.lower() in g["name"].lower() for x in PLAY_GPUS)]
+    with Locked() as L:
+        for g in tg:
+            L.data[f"play:{a.player}:{g['uuid']}"] = dict(kind="play", role=f"play:{a.player}", player=a.player,
+                gpu=g["uuid"], start=now(), expires=now() + PLAY_MAX, pid=os.getpid())
+            preempt(L, g)
+        L.save()
+    print(f"play {a.player} on " + ", ".join(f"{g['name']}#{g['index']}" for g in tg))
+
+def cmd_unplay(a):
+    with Locked() as L:
+        ks = [k for k, l in L.data.items() if l.get("kind") == "play" and l["player"] == a.player]
+        for k in ks: del L.data[k]
+        L.reconcile(); L.save()
+    print(f"unplay {a.player}: released {len(ks)}")
+
+def alert(msg):
+    try:
+        with open(ALERTS, "a") as f: f.write(f"{time.strftime('%F %T')} gpu-lease: {msg}\n")
+    except OSError: pass
+
+def temp_of(uuid):
+    if os.environ.get("GPU_LEASE_WATCH_TEMP"): return float(os.environ["GPU_LEASE_WATCH_TEMP"])
+    for g in gpus():
+        if g["uuid"] == uuid: return g["temp"]
+    return 0
+
+def cmd_run(a):
+    need_debug(a)
+    if not a.cmd: sys.exit("gpu-lease run: no command")
+    g = take_lease(a.role, a.gpu, a.hours, a.mem_gb, a.wait)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=g["uuid"])
+    p = subprocess.Popen(["nice", "-n", "10"] + a.cmd, env=env)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, lambda n, f: p.send_signal(n))
+    with Locked() as L:
+        l = L.data.get(g["uuid"])
+        if l and l["role"] == a.role:
+            l.setdefault("children", []).append(p.pid)
+            if play_on(L.data, g["uuid"]): preempt(L, g)  # play started between take and spawn
+            L.save()
+    hot_since, rc, killed = None, None, False
+    try:
+        while True:
+            try: rc = p.wait(timeout=POLL); break
+            except subprocess.TimeoutExpired: pass
+            with Locked(): pass  # expiry of stale play leases resumes paused jobs
+            t = temp_of(g["uuid"])
+            if t >= KILL_TEMP:
+                hot_since = hot_since or time.time()
+                if time.time() - hot_since >= HOT_SECS and not killed:
+                    alert(f"{a.role} job on {g['name']} {g['uuid']} at {t:.0f}C for {HOT_SECS:.0f}s, SIGTERM pid {p.pid}: {' '.join(a.cmd)[:100]}")
+                    p.send_signal(signal.SIGTERM); signal_tree(p.pid, signal.SIGCONT); killed = True
+            else: hot_since = None
+    finally:
+        with Locked() as L:
+            l = L.data.get(g["uuid"])
+            if l and l["role"] == a.role:
+                l["children"] = [c for c in l.get("children", []) if c != p.pid]
+                l["paused"] = [c for c in l.get("paused", []) if c != p.pid]
+                if not l["children"]: del L.data[g["uuid"]]
+            L.save()
+    sys.exit(rc if rc is not None else 1)
+
+def main():
+    ap = argparse.ArgumentParser(prog="gpu-lease", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sp = ap.add_subparsers(dest="c", required=True)
+    sp.add_parser("list").set_defaults(f=cmd_list)
+    def common(p, run=False):
+        p.add_argument("role"); p.add_argument("--gpu", default="any")
+        p.add_argument("--wait", action="store_true"); p.add_argument("--hours", type=float, default=4); p.add_argument("--mem-gb", type=float, default=0)
+        p.add_argument("--debug", action="store_true", help="required for roles listed in GPU_LEASE_DEBUG_ROLES (debugging only)")
+    t = sp.add_parser("take"); common(t); t.set_defaults(f=cmd_take)
+    r = sp.add_parser("release"); r.add_argument("role"); r.add_argument("--gpu"); r.set_defaults(f=cmd_release)
+    pp = sp.add_parser("play"); pp.add_argument("player", **({"choices": PLAYERS_CFG} if PLAYERS_CFG else {})); pp.add_argument("--gpu", default="any"); pp.set_defaults(f=cmd_play)
+    up = sp.add_parser("unplay"); up.add_argument("player", **({"choices": PLAYERS_CFG} if PLAYERS_CFG else {})); up.set_defaults(f=cmd_unplay)
+    u = sp.add_parser("run"); common(u); u.set_defaults(f=cmd_run)
+    argv = sys.argv[1:]; cmd = []
+    if "--" in argv: i = argv.index("--"); argv, cmd = argv[:i], argv[i+1:]
+    a = ap.parse_args(argv); a.cmd = cmd
+    a.f(a)
+if __name__ == "__main__":
+    main()

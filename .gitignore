@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+*.tmp
+*.bak*
+rigwatch.conf
+gpus.conf
+nascare.conf

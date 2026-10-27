@@ -1,0 +1,13 @@
+[Unit]
+Description=Restart the LLM container if it started without CUDA
+After=docker.service nvidia-persistenced.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Set DOCKER_CMD in rigwatch.conf (or Environment=) if docker needs sudo; User= must own that config.
+ExecStart=/usr/local/bin/llm-gpu-check
+TimeoutStartSec=420
+
+[Install]
+WantedBy=multi-user.target

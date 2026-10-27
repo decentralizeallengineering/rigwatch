@@ -1,0 +1,6 @@
+[Unit]
+Description=Graded thermal watcher
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/thermal-mesh.sh

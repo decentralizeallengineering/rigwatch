@@ -1,0 +1,10 @@
+[Unit]
+Description=Heavy commands outside the heavy slice every 30s
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

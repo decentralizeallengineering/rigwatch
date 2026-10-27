@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""gputemp-guard: token-free GPU thermal guard. Run every 30 s by gputemp-guard.timer.
+
+Lowers a GPU's power limit in steps while it is hot, restores it in steps once it has stayed cool, and re-applies the
+configured power cap every tick (a boot default or driver reload may leave the limit above the cap). It never powers
+anything off and always exits 0.
+
+GPUs come from the inventory file (GPU_CONF, default ~/.config/rigwatch/gpus.conf), one per line:
+    label|local:INDEX|capW            a card on this host's NVIDIA driver
+    label|ssh:[user@]host|capW[|dom]  a card passed through to a VM; temperature and power are read and set over ssh,
+                                      dom is the libvirt domain (a shut-off domain is skipped quietly)
+capW is the baseline power limit in watts, or '-' to use the card's default limit.
+Configuration comes from the environment or rigwatch.conf (see README): GPU_MAX_C, GPU_GUARD_HOT, GPU_GUARD_COOL,
+ALERT_FILE, RIGWATCH_STATE_DIR, GPU_CONF, GPU_SSH_USER, GPU_SSH_KEY, GPU_HANDOFF_LOCK.
+Test hook: GPUTEMP_FAKE=<json file of readings>."""
+import glob, json, os, re, subprocess, sys, time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+CONF_FILE = os.environ.get("RIGWATCH_CONF", os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "rigwatch/rigwatch.conf"))
+
+def _file_conf():
+    res = {}
+    try:
+        for ln in open(CONF_FILE):
+            a, sep, b = ln.split("#")[0].partition("=")
+            a = a.strip()
+            if sep and re.fullmatch(r"[A-Z][A-Z0-9_]*", a): res[a] = b.strip().strip("\"'")
+    except OSError: pass
+    return res
+
+_FC = _file_conf()
+def cfg(key, default=""):
+    """environment, then rigwatch.conf, then default"""
+    return os.environ.get(key, _FC.get(key, default))
+
+def cfg_int(key, default):
+    try: return int(cfg(key, str(default)))
+    except ValueError: return default
+
+STATE_DIR = cfg("RIGWATCH_STATE_DIR", HOME + "/.local/state/rigwatch")
+ALERTS = cfg("ALERT_FILE", STATE_DIR + "/alerts.log")
+HIST = STATE_DIR + "/gpu-history.csv"
+STATE = os.environ.get("GPUTEMP_STATE", STATE_DIR + "/gputemp-guard.json")
+GPU_CONF = cfg("GPU_CONF", os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "rigwatch/gpus.conf"))
+SSH_USER, SSH_KEY, LOCK = cfg("GPU_SSH_USER", os.environ.get("USER", "root")), cfg("GPU_SSH_KEY"), cfg("GPU_HANDOFF_LOCK")
+MAXC = cfg_int("GPU_MAX_C", 70)
+HOT, HOT2, COOL = cfg_int("GPU_GUARD_HOT", MAXC - 2), MAXC, cfg_int("GPU_GUARD_COOL", MAXC - 10)
+STEP_DOWN, STEP_UP, COOL_SECS, UNREAD_SECS = 20, 10, 600, 600
+UNREAD_GRACE = 300  # a running VM silent this long -> stale-reading warning
+Q = "temperature.gpu,power.draw,power.limit,power.min_limit,power.default_limit,fan.speed,utilization.gpu"
+
+def load_inventory(path=GPU_CONF):
+    """-> {label: dict(via, cap, dom)} in file order"""
+    inv = {}
+    try:
+        for ln in open(path):
+            ln = ln.strip()
+            if not ln or ln.startswith("#"): continue
+            f = [x.strip() for x in ln.split("|")]
+            if len(f) < 2 or not f[1].startswith(("local:", "ssh:")): continue
+            cap = float(f[2]) if len(f) > 2 and re.fullmatch(r"\d+(\.\d+)?", f[2]) else None
+            inv[f[0]] = dict(via=f[1], cap=cap, dom=f[3] if len(f) > 3 else "")
+    except OSError: pass
+    return inv
+
+INV = load_inventory()
+EXPECTED = list(INV)
+ABSENT = set()   # labels whose card is physically absent this tick: skipped quietly
+SKIPPED = set()  # labels whose VM is shut off this tick
+
+def pt(now):
+    return datetime.fromtimestamp(now).strftime("%F %T")
+
+def num(x):
+    try: return float(x)
+    except Exception: return None
+
+def parse_row(f):
+    """f: the 7 fields of Q -> reading dict or None"""
+    v = [num(c) for c in f]
+    if len(v) < 7 or v[0] is None or v[2] is None or v[3] is None: return None
+    return dict(temp=v[0], power=v[1], limit=v[2], minlimit=v[3], default=v[4], fan=v[5], util=v[6])
+
+def parse_host(out):
+    """Host rows: 'index,<Q>' -> {index_string: reading}"""
+    res = {}
+    for line in out.strip().splitlines():
+        f = [c.strip() for c in line.split(",")]
+        r = parse_row(f[1:8]) if len(f) >= 8 else None
+        if r: res[f[0]] = r
+    return res
+
+def _gpu_busy():
+    """True while the handoff lock (a card moving between host and VM) is held. Host nvidia-smi queries are skipped then."""
+    import fcntl
+    if not LOCK or not os.path.exists(LOCK): return False
+    try:
+        with open(LOCK) as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+
+def ssh_cmd(host):
+    h = host if "@" in host else f"{SSH_USER}@{host}"
+    k = ["-i", SSH_KEY] if SSH_KEY else []
+    return ["ssh", *k, "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR", h]
+
+def vm_running(dom):
+    """True/False from libvirt; None if libvirt cannot say (then ssh is still tried)."""
+    if not dom: return None
+    try:
+        r = subprocess.run(["virsh", "-c", "qemu:///system", "domstate", dom], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0: return r.stdout.strip() == "running"
+    except Exception: pass
+    return None
+
+def read_vm(label):
+    """(reading|None, skipped). skipped=True when the VM is shut off: no reading, no alarm."""
+    e = INV[label]
+    if vm_running(e["dom"]) is False: return None, True
+    try:
+        r = subprocess.run(ssh_cmd(e["via"][4:]) + ["nvidia-smi", "--query-gpu=" + Q, "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            row = [c.strip() for c in r.stdout.strip().splitlines()[0].split(",")]
+            return parse_row(row), False
+    except Exception: pass
+    return None, False
+
+def read_real():
+    res = {}
+    SKIPPED.clear(); ABSENT.clear()
+    locals_ = {l: e["via"][6:] for l, e in INV.items() if e["via"].startswith("local:")}
+    if locals_:
+        try:
+            if _gpu_busy(): raise RuntimeError("handoff lock held")
+            # With no card on the nvidia driver, nvidia-smi only triggers a module load and a udev storm: skip it.
+            if not glob.glob("/sys/bus/pci/drivers/nvidia/0000:*"): raise RuntimeError("no host card on the nvidia driver")
+            r = subprocess.run(["nice", "-n", "10", "nvidia-smi", "--query-gpu=index," + Q, "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                rows = parse_host(r.stdout)
+                for label, idx in locals_.items():
+                    if idx in rows: res[label] = rows[idx]
+        except Exception:
+            ABSENT.update(locals_)
+    for label, e in INV.items():
+        if e["via"].startswith("ssh:"):
+            rd, skipped = read_vm(label)
+            if skipped: SKIPPED.add(label)
+            elif rd: res[label] = rd
+    return res
+
+def set_real(gpu, watts):
+    w = str(int(watts)); e = INV[gpu]
+    try:
+        if e["via"].startswith("ssh:"):
+            r = subprocess.run(ssh_cmd(e["via"][4:]) + ["sudo", "-n", "nvidia-smi", "-pl", w], capture_output=True, timeout=8)
+        else:
+            r = subprocess.run(["sudo", "-n", "nvidia-smi", "-i", e["via"][6:], "-pl", w], capture_output=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def rotate(path, maxb=5_000_000):
+    try:
+        if os.path.getsize(path) >= maxb: os.replace(path, path + ".1")
+    except OSError: pass
+
+def run(readings, setter, now, state, alert, hist):
+    """Pure-ish core. readings: {gpu: dict}. setter(gpu, watts)->bool. Mutates state."""
+    for g in EXPECTED:
+        s = state.setdefault(g, {})
+        r = readings.get(g)
+        if r is None:
+            if g in SKIPPED or g in ABSENT:  # VM shut off / card physically absent: skip quietly
+                s.pop("unread_since", None); continue
+            if INV[g]["via"].startswith("ssh:"):  # running VM silent: warn only after the grace period
+                s.setdefault("unread_since", now)
+                if now - s["unread_since"] < UNREAD_GRACE: continue
+                msg = f"GPU-THERMAL: {g} stale reading, running VM silent for {now - s['unread_since']:.0f} s"
+            else: msg = f"GPU-THERMAL: {g} unreadable"
+            if now - s.get("unread_alert", 0) >= UNREAD_SECS:
+                alert(msg); s["unread_alert"] = now
+            continue
+        s.pop("unread_since", None)
+        hist(g, r)
+        t, lim, mn = r["temp"], r["limit"], r["minlimit"]
+        if "baseline" not in s:
+            cap = INV[g]["cap"]
+            s["baseline"] = cap if cap else (r["default"] if r["default"] else lim)
+            if cap is None and lim < s["baseline"]: s["baseline"] = lim  # host cap already below default
+        # Enforce the cap every tick: a boot default, driver reload or failed earlier set may leave the limit above baseline.
+        if lim > s["baseline"] and now - s.get("enforce_try", -1e9) >= 60:
+            s["enforce_try"] = now
+            if setter(g, s["baseline"]):
+                alert(f"GPU-THERMAL: {g} power limit {lim:.0f} -> {s['baseline']:.0f} (baseline)")
+                lim = s["baseline"]
+        s["hot_max"] = s.get("hot_max", 0) + 1 if t >= HOT2 else 0
+        if t > COOL: s["cool_since"] = None
+        elif s.get("cool_since") is None: s["cool_since"] = now
+        if t >= HOT and lim > mn:
+            new = max(mn, lim - STEP_DOWN)
+            if setter(g, new):
+                alert(f"GPU-THERMAL: {g} {t:.0f}C, power limit -> {new:.0f}")
+            else:
+                alert(f"GPU-THERMAL: {g} {t:.0f}C, power limit change to {new:.0f} FAILED")
+            s["cool_since"] = None
+        elif t >= HOT2 and s["hot_max"] >= 2 and lim <= mn:
+            if now - s.get("min_alert", 0) >= UNREAD_SECS:
+                alert(f"GPU-THERMAL: {g} at min power and still >={HOT2}C, operator must act"); s["min_alert"] = now
+        elif t <= COOL and s.get("cool_since") is not None and now - s["cool_since"] >= COOL_SECS and lim < s["baseline"]:
+            new = min(s["baseline"], lim + STEP_UP)
+            if setter(g, new): s["cool_since"] = now
+    return state
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__); return
+    now = time.time()
+    try: state = json.load(open(STATE))
+    except Exception: state = {}
+    fake = os.environ.get("GPUTEMP_FAKE")
+    if fake:
+        readings = json.load(open(fake)); setter = lambda g, w: True
+    else:
+        readings = read_real(); setter = set_real
+    def alert(msg):
+        os.makedirs(os.path.dirname(ALERTS), exist_ok=True)
+        with open(ALERTS, "a") as f: f.write(f"{pt(now)} ALERT {msg}\n")
+    rows = []
+    def hist(g, r): rows.append(f"{pt(now)},{g},{r['temp']:.0f},{r['power']},{r['limit']:.0f},{r['fan']},{r['util']}\n")
+    run(readings, setter, now, state, alert, hist)
+    if not fake:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        rotate(HIST)
+        new = not os.path.exists(HIST)
+        with open(HIST, "a") as f:
+            if new: f.write("timestamp,gpu,temp_c,power_w,limit_w,fan_pct,util_pct\n")
+            f.writelines(rows)
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"; json.dump(state, open(tmp, "w")); os.replace(tmp, STATE)
+
+if __name__ == "__main__":
+    try: main()
+    except Exception as e: print("gputemp-guard error:", e, file=sys.stderr)
+    sys.exit(0)

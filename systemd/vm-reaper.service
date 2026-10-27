@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop VMs past their lease
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vm-reaper
