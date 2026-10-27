@@ -1,5 +1,7 @@
 # rigwatch
 
+[![tests](https://github.com/decentralizeallengineering/rigwatch/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/rigwatch/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 Thermal and resource safety scripts for a homelab machine with GPUs, VMs and hot storage.
 
 It exists because GPU boxes with passthrough VMs fail in boring ways: a card creeps past 70 C, a forgotten VM eats the RAM,
